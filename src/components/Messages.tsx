@@ -176,12 +176,8 @@ function toolStatusTone(
 }
 
 export function Messages({ items, isThinking }: MessagesProps) {
-  const listRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  const seenItems = useRef(new Set<string>());
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
-  const [showAll, setShowAll] = useState(false);
-  const maxVisibleItems = 30;
   const toggleExpanded = (id: string) => {
     setExpandedItems((prev) => {
       const next = new Set(prev);
@@ -194,18 +190,7 @@ export function Messages({ items, isThinking }: MessagesProps) {
     });
   };
 
-  const visibleItems =
-    !showAll && items.length > maxVisibleItems
-      ? items.slice(-maxVisibleItems)
-      : items;
-
-  useEffect(() => {
-    items.forEach((item) => {
-      if (!seenItems.current.has(item.id)) {
-        seenItems.current.add(item.id);
-      }
-    });
-  }, [items]);
+  const visibleItems = items;
 
   useEffect(() => {
     if (!bottomRef.current) {
@@ -231,20 +216,7 @@ export function Messages({ items, isThinking }: MessagesProps) {
 
   return (
     <div
-      ref={listRef}
       className="messages messages-full"
-      onScroll={() => {
-        const node = listRef.current;
-        if (!node) {
-          return;
-        }
-        const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
-        if (!showAll && node.scrollTop <= 80) {
-          setShowAll(true);
-        } else if (showAll && distanceFromBottom <= 80) {
-          setShowAll(false);
-        }
-      }}
     >
       {visibleItems.map((item) => {
         if (item.kind === "message") {
