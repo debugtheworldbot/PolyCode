@@ -49,6 +49,12 @@ import { useWorkspaceRefreshOnFocus } from "./features/workspaces/hooks/useWorks
 import { useWorkspaceRestore } from "./features/workspaces/hooks/useWorkspaceRestore";
 import { useResizablePanels } from "./features/layout/hooks/useResizablePanels";
 import { useLayoutMode } from "./features/layout/hooks/useLayoutMode";
+import { useSidebarToggles } from "./features/layout/hooks/useSidebarToggles";
+import {
+  RightPanelCollapseButton,
+  SidebarCollapseButton,
+  TitlebarExpandControls,
+} from "./features/layout/components/SidebarToggleControls";
 import { useAppSettings } from "./features/settings/hooks/useAppSettings";
 import { useUpdater } from "./features/update/hooks/useUpdater";
 import { useComposerImages } from "./features/composer/hooks/useComposerImages";
@@ -111,6 +117,23 @@ function MainApp() {
   const isCompact = layoutMode !== "desktop";
   const isTablet = layoutMode === "tablet";
   const isPhone = layoutMode === "phone";
+  const {
+    sidebarCollapsed,
+    rightPanelCollapsed,
+    collapseSidebar,
+    expandSidebar,
+    collapseRightPanel,
+    expandRightPanel,
+  } = useSidebarToggles({ isCompact });
+  const sidebarToggleProps = {
+    isCompact,
+    sidebarCollapsed,
+    rightPanelCollapsed,
+    onCollapseSidebar: collapseSidebar,
+    onExpandSidebar: expandSidebar,
+    onCollapseRightPanel: collapseRightPanel,
+    onExpandRightPanel: expandRightPanel,
+  };
   const [centerMode, setCenterMode] = useState<"chat" | "diff">("chat");
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [gitPanelMode, setGitPanelMode] = useState<"diff" | "log" | "issues">(
@@ -644,6 +667,8 @@ function MainApp() {
     isPhone ? " layout-phone" : ""
   }${isTablet ? " layout-tablet" : ""}${
     reduceTransparency ? " reduced-transparency" : ""
+  }${!isCompact && sidebarCollapsed ? " sidebar-collapsed" : ""}${
+    !isCompact && rightPanelCollapsed ? " right-panel-collapsed" : ""
   }`;
   const {
     sidebarNode,
@@ -766,6 +791,9 @@ function MainApp() {
     onCopyThread: handleCopyThread,
     onToggleTerminal: handleToggleTerminal,
     showTerminalButton: !isCompact,
+    mainHeaderActionsNode: !isCompact && !rightPanelCollapsed ? (
+      <RightPanelCollapseButton {...sidebarToggleProps} />
+    ) : null,
     filePanelMode,
     onToggleFilePanel: () => {
       setFilePanelMode((prev) => (prev === "git" ? "files" : "git"));
@@ -879,13 +907,26 @@ function MainApp() {
     onGoProjects: () => setActiveTab("projects"),
   });
 
+  const desktopTopbarLeftNodeWithToggle = !isCompact ? (
+    <div className="topbar-leading">
+      <SidebarCollapseButton {...sidebarToggleProps} />
+      {desktopTopbarLeftNode}
+    </div>
+  ) : (
+    desktopTopbarLeftNode
+  );
+
   return (
     <div
       className={appClassName}
       style={
         {
-          "--sidebar-width": `${sidebarWidth}px`,
-          "--right-panel-width": `${rightPanelWidth}px`,
+          "--sidebar-width": `${
+            isCompact ? sidebarWidth : sidebarCollapsed ? 0 : sidebarWidth
+          }px`,
+          "--right-panel-width": `${
+            isCompact ? rightPanelWidth : rightPanelCollapsed ? 0 : rightPanelWidth
+          }px`,
           "--plan-panel-height": `${planPanelHeight}px`,
           "--terminal-panel-height": `${terminalPanelHeight}px`,
           "--debug-panel-height": `${debugPanelHeight}px`,
@@ -894,6 +935,7 @@ function MainApp() {
       }
     >
       <div className="drag-strip" id="titlebar" data-tauri-drag-region />
+      <TitlebarExpandControls {...sidebarToggleProps} />
       {isPhone ? (
         <PhoneLayout
           approvalToastsNode={approvalToastsNode}
@@ -939,7 +981,7 @@ function MainApp() {
           homeNode={homeNode}
           showHome={showHome}
           showWorkspace={Boolean(activeWorkspace && !showHome)}
-          topbarLeftNode={desktopTopbarLeftNode}
+          topbarLeftNode={desktopTopbarLeftNodeWithToggle}
           centerMode={centerMode}
           messagesNode={messagesNode}
           gitDiffViewerNode={gitDiffViewerNode}
