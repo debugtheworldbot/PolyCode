@@ -5,6 +5,11 @@ export type WorkspaceSettings = {
   gitRoot?: string | null;
   codexHome?: string | null;
   codexArgs?: string | null;
+  provider?: ProviderKind | null;
+  claudeBin?: string | null;
+  claudeArgs?: string | null;
+  geminiBin?: string | null;
+  geminiArgs?: string | null;
   launchScript?: string | null;
   launchScripts?: LaunchScriptEntry[] | null;
   worktreeSetupScript?: string | null;
@@ -103,6 +108,7 @@ export type ThreadSummary = {
   id: string;
   name: string;
   updatedAt: number;
+  provider?: ProviderKind;
 };
 
 export type ReviewTarget =
@@ -115,6 +121,7 @@ export type AccessMode = "read-only" | "current" | "full-access";
 export type BackendMode = "local" | "remote";
 export type ThemePreference = "system" | "light" | "dark" | "dim";
 export type PersonalityPreference = "friendly" | "pragmatic";
+export type ProviderKind = "codex" | "claude" | "gemini";
 
 
 export type ComposerEditorPreset = "default" | "helpful" | "smart";
@@ -142,6 +149,11 @@ export type OpenAppTarget = {
 export type AppSettings = {
   codexBin: string | null;
   codexArgs: string | null;
+  defaultProvider?: ProviderKind | null;
+  claudeBin?: string | null;
+  claudeArgs?: string | null;
+  geminiBin?: string | null;
+  geminiArgs?: string | null;
   backendMode: BackendMode;
   remoteBackendHost: string;
   remoteBackendToken: string | null;

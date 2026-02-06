@@ -20,6 +20,7 @@ import type {
   AppSettings,
   CodexDoctorResult,
   DictationModelStatus,
+  ProviderKind,
   WorkspaceSettings,
   OpenAppTarget,
   WorkspaceGroup,
@@ -109,6 +110,18 @@ const COMPOSER_PRESET_CONFIGS: Record<ComposerPreset, ComposerPresetSettings> = 
     composerCodeBlockCopyUseModifier: false,
   },
 };
+
+const PROVIDER_LABELS: Record<ProviderKind, string> = {
+  codex: "Codex",
+  claude: "Claude Code",
+  gemini: "Gemini CLI",
+};
+
+const PROVIDER_OPTIONS: Array<{ value: ProviderKind; label: string }> = [
+  { value: "codex", label: PROVIDER_LABELS.codex },
+  { value: "claude", label: PROVIDER_LABELS.claude },
+  { value: "gemini", label: PROVIDER_LABELS.gemini },
+];
 
 const normalizeOverrideValue = (value: string): string | null => {
   const trimmed = value.trim();
@@ -490,6 +503,7 @@ export function SettingsView({
     () => projects.some((workspace) => workspace.settings.codexHome != null),
     [projects],
   );
+  const effectiveDefaultProvider: ProviderKind = appSettings.defaultProvider ?? "codex";
 
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
@@ -3267,6 +3281,33 @@ export function SettingsView({
                           <div className="settings-project-path">{workspace.path}</div>
                         </div>
                         <div className="settings-override-actions">
+                          <div className="settings-override-field">
+                            <select
+                              className="settings-select settings-select--compact"
+                              value={workspace.settings.provider ?? ""}
+                              onChange={(event) => {
+                                const nextProvider = event.target.value
+                                  ? (event.target.value as ProviderKind)
+                                  : null;
+                                if (nextProvider === (workspace.settings.provider ?? null)) {
+                                  return;
+                                }
+                                void onUpdateWorkspaceSettings(workspace.id, {
+                                  provider: nextProvider,
+                                });
+                              }}
+                              aria-label={`Provider override for ${workspace.name}`}
+                            >
+                              <option value="">
+                                Use default ({PROVIDER_LABELS[effectiveDefaultProvider]})
+                              </option>
+                              {PROVIDER_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
                           <div className="settings-override-field">
                             <input
                               className="settings-input settings-input--compact"

@@ -45,6 +45,14 @@ type UseThreadActionsOptions = {
   ) => void;
 };
 
+function normalizeThreadProvider(value: unknown): "codex" | "claude" | "gemini" {
+  const provider = asString(value).toLowerCase();
+  if (provider === "claude" || provider === "gemini") {
+    return provider;
+  }
+  return "codex";
+}
+
 export function useThreadActions({
   dispatch,
   itemsByThread,
@@ -451,6 +459,7 @@ export function useThreadActions({
           .map((thread, index) => {
             const id = String(thread?.id ?? "");
             const preview = asString(thread?.preview ?? "").trim();
+            const provider = normalizeThreadProvider(thread?.provider);
             const customName = getCustomName(workspace.id, id);
             const fallbackName = `Agent ${index + 1}`;
             const name = customName
@@ -464,6 +473,7 @@ export function useThreadActions({
               id,
               name,
               updatedAt: getThreadTimestamp(thread),
+              provider,
             };
           })
           .filter((entry) => entry.id);
@@ -579,6 +589,7 @@ export function useThreadActions({
             return;
           }
           const preview = asString(thread?.preview ?? "").trim();
+          const provider = normalizeThreadProvider(thread?.provider);
           const customName = getCustomName(workspace.id, id);
           const fallbackName = `Agent ${existing.length + additions.length + 1}`;
           const name = customName
@@ -588,7 +599,7 @@ export function useThreadActions({
                 ? `${preview.slice(0, 38)}…`
                 : preview
               : fallbackName;
-          additions.push({ id, name, updatedAt: getThreadTimestamp(thread) });
+          additions.push({ id, name, updatedAt: getThreadTimestamp(thread), provider });
           existingIds.add(id);
         });
 

@@ -18,12 +18,13 @@ use crate::backend::app_server::{
     build_codex_command_with_bin, build_codex_path_env, check_codex_installation,
     spawn_workspace_session as spawn_workspace_session_inner,
 };
-use crate::shared::process_core::tokio_command;
 use crate::event_sink::TauriEventSink;
+use crate::providers;
 use crate::remote_backend;
-use crate::shared::codex_core;
+use crate::shared::{claude_core, codex_core};
+use crate::shared::process_core::tokio_command;
 use crate::state::AppState;
-use crate::types::WorkspaceEntry;
+use crate::types::{ProviderKind, WorkspaceEntry};
 use self::args::apply_codex_args;
 
 pub(crate) async fn spawn_workspace_session(
@@ -44,6 +45,97 @@ pub(crate) async fn spawn_workspace_session(
         event_sink,
     )
     .await
+}
+
+async fn workspace_provider(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<ProviderKind, String> {
+    let entry = {
+        let workspaces = state.workspaces.lock().await;
+        workspaces
+            .get(workspace_id)
+            .cloned()
+            .ok_or_else(|| "workspace not found".to_string())?
+    };
+    let settings = state.app_settings.lock().await.clone();
+    Ok(providers::resolve_workspace_provider(&entry, Some(&settings)))
+}
+
+async fn workspace_path(state: &AppState, workspace_id: &str) -> Result<String, String> {
+    let workspaces = state.workspaces.lock().await;
+    workspaces
+        .get(workspace_id)
+        .map(|entry| entry.path.clone())
+        .ok_or_else(|| "workspace not found".to_string())
+}
+
+async fn thread_provider(
+    state: &AppState,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<ProviderKind, String> {
+    if !thread_id.trim().is_empty() {
+        let has_claude_thread = {
+            let store = state.claude_threads.lock().await;
+            store
+                .get(workspace_id)
+                .map(|threads| threads.iter().any(|thread| thread.id == thread_id))
+                .unwrap_or(false)
+        };
+        if has_claude_thread {
+            return Ok(ProviderKind::Claude);
+        }
+    }
+    workspace_provider(state, workspace_id).await
+}
+
+fn value_as_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return i64::try_from(number).ok();
+    }
+    value.as_str().and_then(|raw| raw.parse::<i64>().ok())
+}
+
+fn thread_timestamp(thread: &Value) -> i64 {
+    value_as_i64(thread.get("updatedAt"))
+        .or_else(|| value_as_i64(thread.get("updated_at")))
+        .or_else(|| value_as_i64(thread.get("createdAt")))
+        .or_else(|| value_as_i64(thread.get("created_at")))
+        .unwrap_or(0)
+}
+
+fn thread_list_entries_with_provider(response: Value, provider: &ProviderKind) -> Vec<Value> {
+    let mut entries = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    entries.iter_mut().for_each(|entry| {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("provider".to_string(), json!(provider.as_str()));
+        }
+    });
+    entries
+}
+
+fn with_thread_provider(response: Value, provider: &ProviderKind) -> Value {
+    let mut response = response;
+    if let Some(thread) = response
+        .as_object_mut()
+        .and_then(|root| root.get_mut("result"))
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("thread"))
+        .and_then(Value::as_object_mut)
+    {
+        thread.insert("provider".to_string(), json!(provider.as_str()));
+    }
+    response
 }
 
 #[tauri::command]
@@ -160,7 +252,22 @@ pub(crate) async fn start_thread(
         .await;
     }
 
-    codex_core::start_thread_core(&state.sessions, workspace_id).await
+    match workspace_provider(&state, &workspace_id).await? {
+        ProviderKind::Codex => codex_core::start_thread_core(&state.sessions, workspace_id).await,
+        ProviderKind::Claude => {
+            let event_sink = TauriEventSink::new(app);
+            claude_core::start_thread_core(
+                &state.workspaces,
+                &state.app_settings,
+                &state.claude_threads,
+                &state.claude_threads_path,
+                workspace_id,
+                event_sink,
+            )
+            .await
+        }
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -180,7 +287,21 @@ pub(crate) async fn resume_thread(
         .await;
     }
 
-    codex_core::resume_thread_core(&state.sessions, workspace_id, thread_id).await
+    let provider = thread_provider(&state, &workspace_id, &thread_id).await?;
+    match provider {
+        ProviderKind::Codex => {
+            let response = codex_core::resume_thread_core(&state.sessions, workspace_id, thread_id)
+                .await?;
+            Ok(with_thread_provider(response, &ProviderKind::Codex))
+        }
+        ProviderKind::Claude => {
+            let response =
+                claude_core::resume_thread_core(&state.claude_threads, workspace_id, thread_id)
+                    .await?;
+            Ok(with_thread_provider(response, &ProviderKind::Claude))
+        }
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -221,7 +342,45 @@ pub(crate) async fn list_threads(
         .await;
     }
 
-    codex_core::list_threads_core(&state.sessions, workspace_id, cursor, limit).await
+    let _ = cursor;
+    let _ = limit;
+    let workspace_path = workspace_path(&state, &workspace_id).await?;
+    let fetch_limit = Some(100);
+
+    let codex_response =
+        codex_core::list_threads_core(&state.sessions, workspace_id.clone(), None, fetch_limit)
+            .await
+            .ok();
+    let claude_response = claude_core::list_threads_core(
+        &state.claude_threads,
+        &state.claude_threads_path,
+        workspace_id,
+        workspace_path,
+        None,
+        fetch_limit,
+    )
+    .await
+    .ok();
+
+    if codex_response.is_none() && claude_response.is_none() {
+        return Err("failed to list threads for codex and claude providers".to_string());
+    }
+
+    let mut data = Vec::<Value>::new();
+    if let Some(response) = codex_response {
+        data.extend(thread_list_entries_with_provider(response, &ProviderKind::Codex));
+    }
+    if let Some(response) = claude_response {
+        data.extend(thread_list_entries_with_provider(response, &ProviderKind::Claude));
+    }
+    data.sort_by(|left, right| thread_timestamp(right).cmp(&thread_timestamp(left)));
+
+    Ok(json!({
+        "result": {
+            "data": data,
+            "nextCursor": Value::Null,
+        }
+    }))
 }
 
 #[tauri::command]
@@ -242,7 +401,14 @@ pub(crate) async fn list_mcp_server_status(
         .await;
     }
 
-    codex_core::list_mcp_server_status_core(&state.sessions, workspace_id, cursor, limit).await
+    match workspace_provider(&state, &workspace_id).await? {
+        ProviderKind::Codex => {
+            codex_core::list_mcp_server_status_core(&state.sessions, workspace_id, cursor, limit)
+                .await
+        }
+        ProviderKind::Claude => Ok(json!({ "result": { "data": [], "nextCursor": null } })),
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -262,7 +428,21 @@ pub(crate) async fn archive_thread(
         .await;
     }
 
-    codex_core::archive_thread_core(&state.sessions, workspace_id, thread_id).await
+    match thread_provider(&state, &workspace_id, &thread_id).await? {
+        ProviderKind::Codex => {
+            codex_core::archive_thread_core(&state.sessions, workspace_id, thread_id).await
+        }
+        ProviderKind::Claude => {
+            claude_core::archive_thread_core(
+                &state.claude_threads,
+                &state.claude_threads_path,
+                workspace_id,
+                thread_id,
+            )
+            .await
+        }
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -303,7 +483,22 @@ pub(crate) async fn set_thread_name(
         .await;
     }
 
-    codex_core::set_thread_name_core(&state.sessions, workspace_id, thread_id, name).await
+    match thread_provider(&state, &workspace_id, &thread_id).await? {
+        ProviderKind::Codex => {
+            codex_core::set_thread_name_core(&state.sessions, workspace_id, thread_id, name).await
+        }
+        ProviderKind::Claude => {
+            claude_core::set_thread_name_core(
+                &state.claude_threads,
+                &state.claude_threads_path,
+                workspace_id,
+                thread_id,
+                name,
+            )
+            .await
+        }
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -348,18 +543,43 @@ pub(crate) async fn send_user_message(
         .await;
     }
 
-    codex_core::send_user_message_core(
-        &state.sessions,
-        workspace_id,
-        thread_id,
-        text,
-        model,
-        effort,
-        access_mode,
-        images,
-        collaboration_mode,
-    )
-    .await
+    match thread_provider(&state, &workspace_id, &thread_id).await? {
+        ProviderKind::Codex => {
+            codex_core::send_user_message_core(
+                &state.sessions,
+                workspace_id,
+                thread_id,
+                text,
+                model,
+                effort,
+                access_mode,
+                images,
+                collaboration_mode,
+            )
+            .await
+        }
+        ProviderKind::Claude => {
+            let _ = model;
+            let _ = effort;
+            let _ = access_mode;
+            let _ = collaboration_mode;
+            let event_sink = TauriEventSink::new(app);
+            claude_core::send_user_message_core(
+                &state.workspaces,
+                &state.app_settings,
+                &state.claude_threads,
+                &state.claude_turn_cancels,
+                &state.claude_threads_path,
+                workspace_id,
+                thread_id,
+                text,
+                images,
+                event_sink,
+            )
+            .await
+        }
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -399,7 +619,21 @@ pub(crate) async fn turn_interrupt(
         .await;
     }
 
-    codex_core::turn_interrupt_core(&state.sessions, workspace_id, thread_id, turn_id).await
+    match thread_provider(&state, &workspace_id, &thread_id).await? {
+        ProviderKind::Codex => {
+            codex_core::turn_interrupt_core(&state.sessions, workspace_id, thread_id, turn_id).await
+        }
+        ProviderKind::Claude => {
+            let _ = turn_id;
+            claude_core::turn_interrupt_core(
+                &state.claude_turn_cancels,
+                workspace_id,
+                thread_id,
+            )
+            .await
+        }
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -445,7 +679,11 @@ pub(crate) async fn model_list(
         .await;
     }
 
-    codex_core::model_list_core(&state.sessions, workspace_id).await
+    match workspace_provider(&state, &workspace_id).await? {
+        ProviderKind::Codex => codex_core::model_list_core(&state.sessions, workspace_id).await,
+        ProviderKind::Claude => Ok(json!({ "result": { "data": [] } })),
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -464,7 +702,19 @@ pub(crate) async fn account_rate_limits(
         .await;
     }
 
-    codex_core::account_rate_limits_core(&state.sessions, workspace_id).await
+    match workspace_provider(&state, &workspace_id).await? {
+        ProviderKind::Codex => {
+            codex_core::account_rate_limits_core(&state.sessions, workspace_id).await
+        }
+        ProviderKind::Claude => Ok(json!({
+            "result": {
+                "rateLimits": {
+                    "primary": null
+                }
+            }
+        })),
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -483,7 +733,22 @@ pub(crate) async fn account_read(
         .await;
     }
 
-    codex_core::account_read_core(&state.sessions, &state.workspaces, workspace_id).await
+    match workspace_provider(&state, &workspace_id).await? {
+        ProviderKind::Codex => {
+            codex_core::account_read_core(&state.sessions, &state.workspaces, workspace_id).await
+        }
+        ProviderKind::Claude => Ok(json!({
+            "result": {
+                "account": {
+                    "type": "unknown",
+                    "email": null,
+                    "planType": null
+                },
+                "requiresOpenaiAuth": false
+            }
+        })),
+        ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+    }
 }
 
 #[tauri::command]

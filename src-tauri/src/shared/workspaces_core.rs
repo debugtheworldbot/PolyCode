@@ -6,8 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::backend::app_server::WorkspaceSession;
-use crate::codex::args::resolve_workspace_codex_args;
-use crate::codex::home::resolve_workspace_codex_home;
+use crate::providers;
 use crate::storage::write_workspaces;
 use crate::types::{
     AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
@@ -202,6 +201,7 @@ where
         .and_then(|s| s.to_str())
         .unwrap_or("Workspace")
         .to_string();
+    let default_provider = app_settings.lock().await.default_provider.clone();
     let entry = WorkspaceEntry {
         id: Uuid::new_v4().to_string(),
         name: name.clone(),
@@ -210,18 +210,18 @@ where
         kind: WorkspaceKind::Main,
         parent_id: None,
         worktree: None,
-        settings: WorkspaceSettings::default(),
+        settings: WorkspaceSettings {
+            provider: default_provider,
+            ..WorkspaceSettings::default()
+        },
     };
 
-    let (default_bin, codex_args) = {
+    let (provider, default_bin, session_args, session_home) = {
         let settings = app_settings.lock().await;
-        (
-            settings.codex_bin.clone(),
-            resolve_workspace_codex_args(&entry, None, Some(&settings)),
-        )
+        providers::resolve_runtime_config(&entry, None, Some(&settings))
     };
-    let codex_home = resolve_workspace_codex_home(&entry, None);
-    let session = spawn_session(entry.clone(), default_bin, codex_args, codex_home).await?;
+    providers::ensure_provider_spawn_supported(&provider)?;
+    let session = spawn_session(entry.clone(), default_bin, session_args, session_home).await?;
 
     if let Err(error) = {
         let mut workspaces = workspaces.lock().await;
@@ -268,7 +268,11 @@ where
         .iter()
         .map(|value| value.to_string())
         .collect::<Vec<_>>();
-    async move { run_git_command(repo_path, args_owned).await.map(|_output| ()) }
+    async move {
+        run_git_command(repo_path, args_owned)
+            .await
+            .map(|_output| ())
+    }
 }
 
 pub(crate) async fn add_worktree_core<
@@ -396,6 +400,11 @@ where
         parent_id: Some(parent_entry.id.clone()),
         worktree: Some(WorktreeInfo { branch }),
         settings: WorkspaceSettings {
+            provider: parent_entry.settings.provider.clone(),
+            claude_bin: parent_entry.settings.claude_bin.clone(),
+            claude_args: parent_entry.settings.claude_args.clone(),
+            gemini_bin: parent_entry.settings.gemini_bin.clone(),
+            gemini_args: parent_entry.settings.gemini_args.clone(),
             worktree_setup_script: normalize_setup_script(
                 parent_entry.settings.worktree_setup_script.clone(),
             ),
@@ -403,15 +412,12 @@ where
         },
     };
 
-    let (default_bin, codex_args) = {
+    let (provider, default_bin, session_args, session_home) = {
         let settings = app_settings.lock().await;
-        (
-            settings.codex_bin.clone(),
-            resolve_workspace_codex_args(&entry, Some(&parent_entry), Some(&settings)),
-        )
+        providers::resolve_runtime_config(&entry, Some(&parent_entry), Some(&settings))
     };
-    let codex_home = resolve_workspace_codex_home(&entry, Some(&parent_entry));
-    let session = spawn_session(entry.clone(), default_bin, codex_args, codex_home).await?;
+    providers::ensure_provider_spawn_supported(&provider)?;
+    let session = spawn_session(entry.clone(), default_bin, session_args, session_home).await?;
 
     {
         let mut workspaces = workspaces.lock().await;
@@ -447,35 +453,24 @@ where
     Fut: Future<Output = Result<Arc<WorkspaceSession>, String>>,
 {
     let (entry, parent_entry) = resolve_entry_and_parent(workspaces, &workspace_id).await?;
-    let (default_bin, codex_args) = {
+    let (provider, default_bin, session_args, session_home) = {
         let settings = app_settings.lock().await;
-        (
-            settings.codex_bin.clone(),
-            resolve_workspace_codex_args(&entry, parent_entry.as_ref(), Some(&settings)),
-        )
+        providers::resolve_runtime_config(&entry, parent_entry.as_ref(), Some(&settings))
     };
-    let codex_home = resolve_workspace_codex_home(&entry, parent_entry.as_ref());
-    let session = spawn_session(entry.clone(), default_bin, codex_args, codex_home).await?;
+    providers::ensure_provider_spawn_supported(&provider)?;
+    let session = spawn_session(entry.clone(), default_bin, session_args, session_home).await?;
     sessions.lock().await.insert(entry.id, session);
     Ok(())
 }
 
-async fn kill_session_by_id(
-    sessions: &Mutex<HashMap<String, Arc<WorkspaceSession>>>,
-    id: &str,
-) {
+async fn kill_session_by_id(sessions: &Mutex<HashMap<String, Arc<WorkspaceSession>>>, id: &str) {
     if let Some(session) = sessions.lock().await.remove(id) {
         let mut child = session.child.lock().await;
         let _ = child.kill().await;
     }
 }
 
-pub(crate) async fn remove_workspace_core<
-    FRunGit,
-    FutRunGit,
-    FIsMissing,
-    FRemoveDirAll,
->(
+pub(crate) async fn remove_workspace_core<FRunGit, FutRunGit, FIsMissing, FRemoveDirAll>(
     id: String,
     workspaces: &Mutex<HashMap<String, WorkspaceEntry>>,
     sessions: &Mutex<HashMap<String, Arc<WorkspaceSession>>>,
@@ -518,11 +513,8 @@ where
 
         let child_path = PathBuf::from(&child.path);
         if child_path.exists() {
-            if let Err(error) = run_git_command(
-                &repo_path,
-                &["worktree", "remove", "--force", &child.path],
-            )
-            .await
+            if let Err(error) =
+                run_git_command(&repo_path, &["worktree", "remove", "--force", &child.path]).await
             {
                 if is_missing_worktree_error(&error) {
                     if child_path.exists() {
@@ -739,8 +731,8 @@ where
         )
         .await
         {
-            let _ = run_git_command(&parent_root, &["branch", "-m", &final_branch, &old_branch])
-                .await;
+            let _ =
+                run_git_command(&parent_root, &["branch", "-m", &final_branch, &old_branch]).await;
             return Err(error);
         }
     }
@@ -774,15 +766,38 @@ where
     let was_connected = sessions.lock().await.contains_key(&entry_snapshot.id);
     if was_connected {
         kill_session_by_id(sessions, &entry_snapshot.id).await;
-        let (default_bin, codex_args) = {
+        let (provider, default_bin, session_args, session_home) = {
             let settings = app_settings.lock().await;
-            (
-                settings.codex_bin.clone(),
-                resolve_workspace_codex_args(&entry_snapshot, Some(&parent), Some(&settings)),
-            )
+            providers::resolve_runtime_config(&entry_snapshot, Some(&parent), Some(&settings))
         };
-        let codex_home = resolve_workspace_codex_home(&entry_snapshot, Some(&parent));
-        match spawn_session(entry_snapshot.clone(), default_bin, codex_args, codex_home).await {
+        match providers::ensure_provider_spawn_supported(&provider) {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!(
+                    "rename_worktree: provider gate rejected {} after rename: {error}",
+                    entry_snapshot.id
+                );
+                return Ok(WorkspaceInfo {
+                    id: entry_snapshot.id,
+                    name: entry_snapshot.name,
+                    path: entry_snapshot.path,
+                    codex_bin: entry_snapshot.codex_bin,
+                    connected: false,
+                    kind: entry_snapshot.kind,
+                    parent_id: entry_snapshot.parent_id,
+                    worktree: entry_snapshot.worktree,
+                    settings: entry_snapshot.settings,
+                });
+            }
+        }
+        match spawn_session(
+            entry_snapshot.clone(),
+            default_bin,
+            session_args,
+            session_home,
+        )
+        .await
+        {
             Ok(session) => {
                 sessions
                     .lock()
@@ -905,7 +920,11 @@ where
             &["push", &remote_name, &format!("{new_branch}:{new_branch}")],
         )
         .await?;
-        run_git_command(&parent_root, &["push", &remote_name, &format!(":{old_branch}")]).await?;
+        run_git_command(
+            &parent_root,
+            &["push", &remote_name, &format!(":{old_branch}")],
+        )
+        .await?;
     } else {
         run_git_command(&parent_root, &["push", &remote_name, &new_branch]).await?;
     }
@@ -924,11 +943,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn update_workspace_settings_core<
-    FApplySettings,
-    FSpawn,
-    FutSpawn,
->(
+pub(crate) async fn update_workspace_settings_core<FApplySettings, FSpawn, FutSpawn>(
     id: String,
     mut settings: WorkspaceSettings,
     workspaces: &Mutex<HashMap<String, WorkspaceEntry>>,
@@ -939,8 +954,11 @@ pub(crate) async fn update_workspace_settings_core<
     spawn_session: FSpawn,
 ) -> Result<WorkspaceInfo, String>
 where
-    FApplySettings: Fn(&mut HashMap<String, WorkspaceEntry>, &str, WorkspaceSettings)
-        -> Result<WorkspaceEntry, String>,
+    FApplySettings: Fn(
+        &mut HashMap<String, WorkspaceEntry>,
+        &str,
+        WorkspaceSettings,
+    ) -> Result<WorkspaceEntry, String>,
     FSpawn: Fn(WorkspaceEntry, Option<String>, Option<String>, Option<PathBuf>) -> FutSpawn,
     FutSpawn: Future<Output = Result<Arc<WorkspaceSession>, String>>,
 {
@@ -950,8 +968,6 @@ where
         previous_entry,
         entry_snapshot,
         parent_entry,
-        previous_codex_home,
-        previous_codex_args,
         previous_worktree_setup_script,
         child_entries,
     ) = {
@@ -960,8 +976,6 @@ where
             .get(&id)
             .cloned()
             .ok_or_else(|| "workspace not found".to_string())?;
-        let previous_codex_home = previous_entry.settings.codex_home.clone();
-        let previous_codex_args = previous_entry.settings.codex_args.clone();
         let previous_worktree_setup_script = previous_entry.settings.worktree_setup_script.clone();
         let entry_snapshot = apply_settings_update(&mut workspaces, &id, settings)?;
         let parent_entry = entry_snapshot
@@ -978,38 +992,49 @@ where
             previous_entry,
             entry_snapshot,
             parent_entry,
-            previous_codex_home,
-            previous_codex_args,
             previous_worktree_setup_script,
             child_entries,
         )
     };
 
-    let codex_home_changed = previous_codex_home != entry_snapshot.settings.codex_home;
-    let codex_args_changed = previous_codex_args != entry_snapshot.settings.codex_args;
+    let app_settings_snapshot = app_settings.lock().await.clone();
+    let previous_runtime = providers::resolve_runtime_config(
+        &previous_entry,
+        parent_entry.as_ref(),
+        Some(&app_settings_snapshot),
+    );
+    let next_runtime = providers::resolve_runtime_config(
+        &entry_snapshot,
+        parent_entry.as_ref(),
+        Some(&app_settings_snapshot),
+    );
+    let runtime_changed = previous_runtime != next_runtime;
     let worktree_setup_script_changed =
         previous_worktree_setup_script != entry_snapshot.settings.worktree_setup_script;
     let connected = sessions.lock().await.contains_key(&id);
-    if connected && (codex_home_changed || codex_args_changed) {
+    if connected && runtime_changed {
         let rollback_entry = previous_entry.clone();
-        let (default_bin, codex_args) = {
-            let settings = app_settings.lock().await;
-            (
-                settings.codex_bin.clone(),
-                resolve_workspace_codex_args(&entry_snapshot, parent_entry.as_ref(), Some(&settings)),
-            )
+        let (provider, default_bin, session_args, session_home) = next_runtime.clone();
+        if let Err(error) = providers::ensure_provider_spawn_supported(&provider) {
+            let mut workspaces = workspaces.lock().await;
+            workspaces.insert(rollback_entry.id.clone(), rollback_entry);
+            return Err(error);
+        }
+        let new_session = match spawn_session(
+            entry_snapshot.clone(),
+            default_bin,
+            session_args,
+            session_home,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let mut workspaces = workspaces.lock().await;
+                workspaces.insert(rollback_entry.id.clone(), rollback_entry);
+                return Err(error);
+            }
         };
-        let codex_home = resolve_workspace_codex_home(&entry_snapshot, parent_entry.as_ref());
-        let new_session =
-            match spawn_session(entry_snapshot.clone(), default_bin, codex_args, codex_home).await
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    let mut workspaces = workspaces.lock().await;
-                    workspaces.insert(rollback_entry.id.clone(), rollback_entry);
-                    return Err(error);
-                }
-            };
         if let Some(old_session) = sessions
             .lock()
             .await
@@ -1019,28 +1044,34 @@ where
             let _ = child.kill().await;
         }
     }
-    if codex_home_changed || codex_args_changed {
-        let app_settings_snapshot = app_settings.lock().await.clone();
-        let default_bin = app_settings_snapshot.codex_bin.clone();
+    if runtime_changed {
         for child in &child_entries {
             let connected = sessions.lock().await.contains_key(&child.id);
             if !connected {
                 continue;
             }
-            let previous_child_home = resolve_workspace_codex_home(child, Some(&previous_entry));
-            let next_child_home = resolve_workspace_codex_home(child, Some(&entry_snapshot));
-            let previous_child_args =
-                resolve_workspace_codex_args(child, Some(&previous_entry), Some(&app_settings_snapshot));
-            let next_child_args =
-                resolve_workspace_codex_args(child, Some(&entry_snapshot), Some(&app_settings_snapshot));
-            if previous_child_home == next_child_home && previous_child_args == next_child_args {
+            let previous_child_runtime = providers::resolve_runtime_config(
+                child,
+                Some(&previous_entry),
+                Some(&app_settings_snapshot),
+            );
+            let next_child_runtime = providers::resolve_runtime_config(
+                child,
+                Some(&entry_snapshot),
+                Some(&app_settings_snapshot),
+            );
+            if previous_child_runtime == next_child_runtime {
+                continue;
+            }
+            let (provider, default_bin, session_args, session_home) = next_child_runtime;
+            if providers::ensure_provider_spawn_supported(&provider).is_err() {
                 continue;
             }
             let new_session = match spawn_session(
                 child.clone(),
-                default_bin.clone(),
-                next_child_args,
-                next_child_home,
+                default_bin,
+                session_args,
+                session_home,
             )
             .await
             {
@@ -1053,11 +1084,7 @@ where
                     continue;
                 }
             };
-            if let Some(old_session) = sessions
-                .lock()
-                .await
-                .insert(child.id.clone(), new_session)
-            {
+            if let Some(old_session) = sessions.lock().await.insert(child.id.clone(), new_session) {
                 let mut child = old_session.child.lock().await;
                 let _ = child.kill().await;
             }
@@ -1163,9 +1190,7 @@ fn sort_workspaces(workspaces: &mut [WorkspaceInfo]) {
         if a_order != b_order {
             return a_order.cmp(&b_order);
         }
-        a.name
-            .cmp(&b.name)
-            .then_with(|| a.id.cmp(&b.id))
+        a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id))
     });
 }
 

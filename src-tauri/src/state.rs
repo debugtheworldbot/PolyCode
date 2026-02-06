@@ -5,6 +5,10 @@ use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex;
 
 use crate::dictation::DictationState;
+use crate::shared::claude_core::{
+    claude_threads_path as resolve_claude_threads_path, read_threads_snapshot, ClaudeThreadsStore,
+    ClaudeTurnCancelsStore,
+};
 use crate::shared::codex_core::CodexLoginCancelState;
 use crate::storage::{read_settings, read_workspaces};
 use crate::types::{AppSettings, WorkspaceEntry};
@@ -20,6 +24,9 @@ pub(crate) struct AppState {
     pub(crate) app_settings: Mutex<AppSettings>,
     pub(crate) dictation: Mutex<DictationState>,
     pub(crate) codex_login_cancels: Mutex<HashMap<String, CodexLoginCancelState>>,
+    pub(crate) claude_threads_path: PathBuf,
+    pub(crate) claude_threads: ClaudeThreadsStore,
+    pub(crate) claude_turn_cancels: ClaudeTurnCancelsStore,
 }
 
 impl AppState {
@@ -30,8 +37,10 @@ impl AppState {
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| ".".into()));
         let storage_path = data_dir.join("workspaces.json");
         let settings_path = data_dir.join("settings.json");
+        let claude_threads_path = resolve_claude_threads_path(&data_dir);
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
+        let claude_threads = read_threads_snapshot(&claude_threads_path).unwrap_or_default();
         Self {
             workspaces: Mutex::new(workspaces),
             sessions: Mutex::new(HashMap::new()),
@@ -42,6 +51,9 @@ impl AppState {
             app_settings: Mutex::new(app_settings),
             dictation: Mutex::new(DictationState::default()),
             codex_login_cancels: Mutex::new(HashMap::new()),
+            claude_threads_path,
+            claude_threads: Arc::new(Mutex::new(claude_threads)),
+            claude_turn_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

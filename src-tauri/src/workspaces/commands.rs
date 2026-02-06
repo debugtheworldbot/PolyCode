@@ -3,47 +3,75 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use serde_json::json;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-#[cfg(target_os = "macos")]
-use super::macos::get_open_app_icon_inner;
 use super::files::{list_workspace_files_inner, read_workspace_file_inner, WorkspaceFileResponse};
 use super::git::{
     git_branch_exists, git_find_remote_for_branch, git_get_origin_url, git_remote_branch_exists,
     git_remote_exists, is_missing_worktree_error, run_git_command, run_git_command_bytes,
     run_git_command_owned, run_git_diff, unique_branch_name,
 };
+#[cfg(target_os = "macos")]
+use super::macos::get_open_app_icon_inner;
 use super::settings::apply_workspace_settings_update;
 use super::worktree::{
     build_clone_destination_path, null_device_path, sanitize_worktree_name, unique_worktree_path,
     unique_worktree_path_for_rename,
 };
 
-use crate::backend::app_server::WorkspaceSession;
+use crate::backend::app_server::{spawn_passthrough_workspace_session, WorkspaceSession};
+use crate::backend::events::AppServerEvent;
 use crate::codex::spawn_workspace_session;
-use crate::codex::args::resolve_workspace_codex_args;
-use crate::codex::home::resolve_workspace_codex_home;
 use crate::git_utils::resolve_git_root;
+use crate::providers;
 use crate::remote_backend;
 use crate::shared::process_core::tokio_command;
 use crate::shared::workspaces_core;
 use crate::state::AppState;
 use crate::storage::write_workspaces;
 use crate::types::{
-    WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeSetupStatus,
+    ProviderKind, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings,
+    WorktreeSetupStatus,
 };
 use crate::utils::{git_env_path, resolve_git_binary};
 
 fn spawn_with_app(
-    app: &AppHandle,
+    app: AppHandle,
     entry: WorkspaceEntry,
     default_bin: Option<String>,
     codex_args: Option<String>,
     codex_home: Option<PathBuf>,
 ) -> impl std::future::Future<Output = Result<Arc<WorkspaceSession>, String>> {
-    spawn_workspace_session(entry, default_bin, codex_args, app.clone(), codex_home)
+    let provider = providers::resolve_workspace_provider(&entry, None);
+    let workspace_id = entry.id.clone();
+    async move {
+        providers::ensure_provider_spawn_supported(&provider)?;
+        let session = match provider {
+            ProviderKind::Codex => {
+                spawn_workspace_session(entry, default_bin, codex_args, app.clone(), codex_home)
+                    .await?
+            }
+            ProviderKind::Claude => spawn_passthrough_workspace_session(entry).await?,
+            ProviderKind::Gemini => {
+                return Err("Provider `gemini` is not implemented yet.".to_string())
+            }
+        };
+        if matches!(provider, ProviderKind::Claude) {
+            let _ = app.emit(
+                "app-server-event",
+                AppServerEvent {
+                    workspace_id: workspace_id.clone(),
+                    message: json!({
+                        "method": "codex/connected",
+                        "params": { "workspaceId": workspace_id.clone() }
+                    }),
+                },
+            );
+        }
+        Ok(session)
+    }
 }
 
 #[tauri::command]
@@ -73,20 +101,19 @@ pub(crate) async fn read_workspace_file(
     .await
 }
 
-
 #[tauri::command]
 pub(crate) async fn list_workspaces(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Vec<WorkspaceInfo>, String> {
     if remote_backend::is_remote_mode(&*state).await {
-        let response = remote_backend::call_remote(&*state, app, "list_workspaces", json!({})).await?;
+        let response =
+            remote_backend::call_remote(&*state, app, "list_workspaces", json!({})).await?;
         return serde_json::from_value(response).map_err(|err| err.to_string());
     }
 
     Ok(workspaces_core::list_workspaces_core(&state.workspaces, &state.sessions).await)
 }
-
 
 #[tauri::command]
 pub(crate) async fn is_workspace_path_dir(
@@ -106,7 +133,6 @@ pub(crate) async fn is_workspace_path_dir(
     }
     Ok(workspaces_core::is_workspace_path_dir_core(&path))
 }
-
 
 #[tauri::command]
 pub(crate) async fn add_workspace(
@@ -136,12 +162,11 @@ pub(crate) async fn add_workspace(
         &state.app_settings,
         &state.storage_path,
         |entry, default_bin, codex_args, codex_home| {
-            spawn_with_app(&app, entry, default_bin, codex_args, codex_home)
+            spawn_with_app(app.clone(), entry, default_bin, codex_args, codex_home)
         },
     )
     .await
 }
-
 
 #[tauri::command]
 pub(crate) async fn add_clone(
@@ -215,34 +240,31 @@ pub(crate) async fn add_clone(
         parent_id: None,
         worktree: None,
         settings: WorkspaceSettings {
+            provider: source_entry.settings.provider.clone(),
+            claude_bin: source_entry.settings.claude_bin.clone(),
+            claude_args: source_entry.settings.claude_args.clone(),
+            gemini_bin: source_entry.settings.gemini_bin.clone(),
+            gemini_args: source_entry.settings.gemini_args.clone(),
             group_id: inherited_group_id,
             ..WorkspaceSettings::default()
         },
     };
 
-    let (default_bin, codex_args) = {
+    let (provider, default_bin, session_args, session_home) = {
         let settings = state.app_settings.lock().await;
-        (
-            settings.codex_bin.clone(),
-            resolve_workspace_codex_args(&entry, None, Some(&settings)),
-        )
+        providers::resolve_runtime_config(&entry, None, Some(&settings))
     };
-    let codex_home = resolve_workspace_codex_home(&entry, None);
-    let session = match spawn_workspace_session(
-        entry.clone(),
-        default_bin,
-        codex_args,
-        app,
-        codex_home,
-    )
-    .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&destination_path).await;
-            return Err(error);
-        }
-    };
+    providers::ensure_provider_spawn_supported(&provider)?;
+    let session =
+        match spawn_with_app(app.clone(), entry.clone(), default_bin, session_args, session_home)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&destination_path).await;
+                return Err(error);
+            }
+        };
 
     if let Err(error) = {
         let mut workspaces = state.workspaces.lock().await;
@@ -278,7 +300,6 @@ pub(crate) async fn add_clone(
         settings: entry.settings,
     })
 }
-
 
 #[tauri::command]
 pub(crate) async fn add_worktree(
@@ -335,7 +356,7 @@ pub(crate) async fn add_worktree(
             })
         },
         |entry, default_bin, codex_args, codex_home| {
-            spawn_with_app(&app, entry, default_bin, codex_args, codex_home)
+            spawn_with_app(app.clone(), entry, default_bin, codex_args, codex_home)
         },
     )
     .await
@@ -386,10 +407,8 @@ pub(crate) async fn worktree_setup_mark_ran(
         .path()
         .app_data_dir()
         .map_err(|err| format!("Failed to resolve app data dir: {err}"))?;
-    workspaces_core::worktree_setup_mark_ran_core(&state.workspaces, &workspace_id, &data_dir)
-        .await
+    workspaces_core::worktree_setup_mark_ran_core(&state.workspaces, &workspace_id, &data_dir).await
 }
-
 
 #[tauri::command]
 pub(crate) async fn remove_workspace(
@@ -423,7 +442,6 @@ pub(crate) async fn remove_workspace(
     .await
 }
 
-
 #[tauri::command]
 pub(crate) async fn remove_worktree(
     id: String,
@@ -453,7 +471,6 @@ pub(crate) async fn remove_worktree(
     )
     .await
 }
-
 
 #[tauri::command]
 pub(crate) async fn rename_worktree(
@@ -504,12 +521,11 @@ pub(crate) async fn rename_worktree(
             })
         },
         |entry, default_bin, codex_args, codex_home| {
-            spawn_with_app(&app, entry, default_bin, codex_args, codex_home)
+            spawn_with_app(app.clone(), entry, default_bin, codex_args, codex_home)
         },
     )
     .await
 }
-
 
 #[tauri::command]
 pub(crate) async fn rename_worktree_upstream(
@@ -566,7 +582,6 @@ pub(crate) async fn rename_worktree_upstream(
     .await
 }
 
-
 #[tauri::command]
 pub(crate) async fn apply_worktree_changes(
     workspace_id: String,
@@ -581,10 +596,7 @@ pub(crate) async fn apply_worktree_changes(
         if !entry.kind.is_worktree() {
             return Err("Not a worktree workspace.".to_string());
         }
-        let parent_id = entry
-            .parent_id
-            .clone()
-            .ok_or("worktree parent not found")?;
+        let parent_id = entry.parent_id.clone().ok_or("worktree parent not found")?;
         let parent = workspaces
             .get(&parent_id)
             .cloned()
@@ -595,8 +607,7 @@ pub(crate) async fn apply_worktree_changes(
     let worktree_root = resolve_git_root(&entry)?;
     let parent_root = resolve_git_root(&parent)?;
 
-    let parent_status =
-        run_git_command_bytes(&parent_root, &["status", "--porcelain"]).await?;
+    let parent_status = run_git_command_bytes(&parent_root, &["status", "--porcelain"]).await?;
     if !String::from_utf8_lossy(&parent_status).trim().is_empty() {
         return Err(
             "Your current branch has uncommitted changes. Please commit, stash, or discard them before applying worktree changes."
@@ -605,11 +616,13 @@ pub(crate) async fn apply_worktree_changes(
     }
 
     let mut patch: Vec<u8> = Vec::new();
-    let staged_patch =
-        run_git_diff(&worktree_root, &["diff", "--binary", "--no-color", "--cached"]).await?;
+    let staged_patch = run_git_diff(
+        &worktree_root,
+        &["diff", "--binary", "--no-color", "--cached"],
+    )
+    .await?;
     patch.extend_from_slice(&staged_patch);
-    let unstaged_patch =
-        run_git_diff(&worktree_root, &["diff", "--binary", "--no-color"]).await?;
+    let unstaged_patch = run_git_diff(&worktree_root, &["diff", "--binary", "--no-color"]).await?;
     patch.extend_from_slice(&unstaged_patch);
 
     let untracked_output = run_git_command_bytes(
@@ -696,7 +709,6 @@ pub(crate) async fn apply_worktree_changes(
     Err(detail.to_string())
 }
 
-
 #[tauri::command]
 pub(crate) async fn update_workspace_settings(
     id: String,
@@ -726,12 +738,11 @@ pub(crate) async fn update_workspace_settings(
             apply_workspace_settings_update(workspaces, workspace_id, next_settings)
         },
         |entry, default_bin, codex_args, codex_home| {
-            spawn_with_app(&app, entry, default_bin, codex_args, codex_home)
+            spawn_with_app(app.clone(), entry, default_bin, codex_args, codex_home)
         },
     )
     .await
 }
-
 
 #[tauri::command]
 pub(crate) async fn update_workspace_codex_bin(
@@ -762,7 +773,6 @@ pub(crate) async fn update_workspace_codex_bin(
     .await
 }
 
-
 #[tauri::command]
 pub(crate) async fn connect_workspace(
     id: String,
@@ -770,8 +780,7 @@ pub(crate) async fn connect_workspace(
     app: AppHandle,
 ) -> Result<(), String> {
     if remote_backend::is_remote_mode(&*state).await {
-        remote_backend::call_remote(&*state, app, "connect_workspace", json!({ "id": id }))
-            .await?;
+        remote_backend::call_remote(&*state, app, "connect_workspace", json!({ "id": id })).await?;
         return Ok(());
     }
 
@@ -781,12 +790,11 @@ pub(crate) async fn connect_workspace(
         &state.sessions,
         &state.app_settings,
         |entry, default_bin, codex_args, codex_home| {
-            spawn_with_app(&app, entry, default_bin, codex_args, codex_home)
+            spawn_with_app(app.clone(), entry, default_bin, codex_args, codex_home)
         },
     )
     .await
 }
-
 
 #[tauri::command]
 pub(crate) async fn list_workspace_files(
@@ -810,7 +818,6 @@ pub(crate) async fn list_workspace_files(
     })
     .await
 }
-
 
 #[tauri::command]
 pub(crate) async fn open_workspace_in(
@@ -854,7 +861,6 @@ pub(crate) async fn open_workspace_in(
         "Failed to open app ({target_label} returned {exit_detail})."
     ))
 }
-
 
 #[tauri::command]
 pub(crate) async fn get_open_app_icon(app_name: String) -> Result<Option<String>, String> {

@@ -2344,13 +2344,50 @@ function MainApp() {
           openAppIconById,
           onUpdateAppSettings: async (next) => {
             await queueSaveSettings(next);
+            const previousDefaultProvider = appSettings.defaultProvider ?? "codex";
+            const nextDefaultProvider = next.defaultProvider ?? "codex";
+            if (previousDefaultProvider !== nextDefaultProvider) {
+              const inheritedWorkspaces = workspaces.filter(
+                (workspace) => workspace.settings.provider == null,
+              );
+              inheritedWorkspaces.forEach((workspace) => {
+                resetWorkspaceThreads(workspace.id);
+                setActiveThreadId(null, workspace.id);
+                void listThreadsForWorkspace(workspace);
+              });
+            }
           },
           onRunDoctor: doctor,
           onUpdateWorkspaceCodexBin: async (id, codexBin) => {
             await updateWorkspaceCodexBin(id, codexBin);
           },
           onUpdateWorkspaceSettings: async (id, settings) => {
-            await updateWorkspaceSettings(id, settings);
+            const providerUpdated = Object.prototype.hasOwnProperty.call(
+              settings,
+              "provider",
+            );
+            const previous = workspacesById.get(id);
+            const previousEffectiveProvider =
+              previous?.settings.provider ?? appSettings.defaultProvider ?? "codex";
+            const updated = await updateWorkspaceSettings(id, settings);
+            if (!providerUpdated) {
+              return;
+            }
+            const nextEffectiveProvider =
+              updated.settings.provider ?? appSettings.defaultProvider ?? "codex";
+            if (nextEffectiveProvider === previousEffectiveProvider) {
+              return;
+            }
+            if (!updated.connected) {
+              try {
+                await connectWorkspace(updated);
+              } catch {
+                // Listing can still succeed for providers that don't require a live bridge.
+              }
+            }
+            resetWorkspaceThreads(id);
+            setActiveThreadId(null, id);
+            void listThreadsForWorkspace(updated);
           },
           scaleShortcutTitle,
           scaleShortcutText,

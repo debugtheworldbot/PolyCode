@@ -159,6 +159,19 @@ pub(crate) fn build_codex_command_with_bin(codex_bin: Option<String>) -> Command
     command
 }
 
+fn build_passthrough_command() -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = tokio_command("cmd");
+        command.args(["/C", "more"]);
+        command
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio_command("cat")
+    }
+}
+
 pub(crate) async fn check_codex_installation(
     codex_bin: Option<String>,
 ) -> Result<Option<String>, String> {
@@ -375,6 +388,39 @@ pub(crate) async fn spawn_workspace_session<E: EventSink>(
     event_sink.emit_app_server_event(payload);
 
     Ok(session)
+}
+
+pub(crate) async fn spawn_passthrough_workspace_session(
+    entry: WorkspaceEntry,
+) -> Result<Arc<WorkspaceSession>, String> {
+    let mut command = build_passthrough_command();
+    command.current_dir(&entry.path);
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdin = child.stdin.take().ok_or("missing stdin")?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let stderr = child.stderr.take().ok_or("missing stderr")?;
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(_line)) = lines.next_line().await {}
+    });
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(_line)) = lines.next_line().await {}
+    });
+
+    Ok(Arc::new(WorkspaceSession {
+        entry,
+        child: Mutex::new(child),
+        stdin: Mutex::new(stdin),
+        pending: Mutex::new(HashMap::new()),
+        next_id: AtomicU64::new(1),
+        background_thread_callbacks: Mutex::new(HashMap::new()),
+    }))
 }
 
 #[cfg(test)]

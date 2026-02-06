@@ -376,6 +376,7 @@ describe("useThreadActions", () => {
           id: "thread-1",
           name: "Custom",
           updatedAt: 5000,
+          provider: "codex",
         },
       ],
     });
@@ -455,7 +456,7 @@ describe("useThreadActions", () => {
       workspaceId: "ws-1",
       threads: [
         { id: "thread-1", name: "Agent 1", updatedAt: 6000 },
-        { id: "thread-2", name: "Older preview", updatedAt: 4000 },
+        { id: "thread-2", name: "Older preview", updatedAt: 4000, provider: "codex" },
       ],
     });
     expect(dispatch).toHaveBeenCalledWith({

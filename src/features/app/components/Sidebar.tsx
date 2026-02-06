@@ -289,7 +289,7 @@ export function Sidebar({
       }
     });
 
-    return groups
+    const flattened = groups
       .sort((a, b) => a.pinTime - b.pinTime)
       .flatMap((group) =>
         group.rows.map((row) => ({
@@ -297,6 +297,15 @@ export function Sidebar({
           workspaceId: group.workspaceId,
         })),
       );
+    const seen = new Set<string>();
+    return flattened.filter((row) => {
+      const key = `${row.workspaceId}:${row.thread.id}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
   }, [
     workspaces,
     threadsByWorkspace,

@@ -10,6 +10,13 @@ const nestedThread: ThreadSummary = {
   updatedAt: 900,
 };
 
+const claudeThread: ThreadSummary = {
+  id: "thread-claude",
+  name: "Claude Agent",
+  updatedAt: 950,
+  provider: "claude",
+};
+
 const thread: ThreadSummary = {
   id: "thread-1",
   name: "Alpha",
@@ -132,5 +139,16 @@ describe("ThreadList", () => {
       "thread-2",
       false,
     );
+  });
+
+  it("renders a Claude icon for Claude threads", () => {
+    render(
+      <ThreadList
+        {...baseProps}
+        unpinnedRows={[{ thread: claudeThread, depth: 0 }]}
+      />,
+    );
+
+    expect(screen.getByLabelText("Claude Code")).toBeTruthy();
   });
 });

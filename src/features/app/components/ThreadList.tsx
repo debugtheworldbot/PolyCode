@@ -101,6 +101,14 @@ export function ThreadList({
         <span className={`thread-status ${statusClass}`} aria-hidden />
         {isPinned && <span className="thread-pin-icon" aria-label="Pinned">📌</span>}
         <span className="thread-name">{thread.name}</span>
+        {thread.provider === "claude" && (
+          <span
+            className="thread-provider-icon thread-provider-icon-claude"
+            aria-label="Claude Code"
+          >
+            ✶
+          </span>
+        )}
         <div className="thread-meta">
           {relativeTime && <span className="thread-time">{relativeTime}</span>}
           <div className="thread-menu">

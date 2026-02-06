@@ -16,6 +16,13 @@ const otherThread: ThreadSummary = {
   updatedAt: 800,
 };
 
+const claudeThread: ThreadSummary = {
+  id: "thread-claude",
+  name: "Pinned Claude",
+  updatedAt: 700,
+  provider: "claude",
+};
+
 const statusMap = {
   "thread-1": { isProcessing: false, hasUnread: false, isReviewing: true },
   "thread-2": { isProcessing: true, hasUnread: false, isReviewing: false },
@@ -100,5 +107,16 @@ describe("PinnedThreadList", () => {
       "thread-2",
       true,
     );
+  });
+
+  it("renders a Claude icon for Claude threads", () => {
+    render(
+      <PinnedThreadList
+        {...baseProps}
+        rows={[{ thread: claudeThread, depth: 0, workspaceId: "ws-1" }]}
+      />,
+    );
+
+    expect(screen.getByLabelText("Claude Code")).toBeTruthy();
   });
 });

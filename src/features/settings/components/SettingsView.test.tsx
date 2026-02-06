@@ -520,7 +520,177 @@ describe("SettingsView Environments", () => {
 });
 
 describe("SettingsView Codex overrides", () => {
+  it("updates default provider in codex section", async () => {
+    cleanup();
+    const onUpdateAppSettings = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SettingsView
+        workspaceGroups={[]}
+        groupedWorkspaces={[]}
+        ungroupedLabel="Ungrouped"
+        onClose={vi.fn()}
+        onMoveWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
+        onCreateWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onRenameWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onMoveWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onDeleteWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onAssignWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        reduceTransparency={false}
+        onToggleTransparency={vi.fn()}
+        appSettings={baseSettings}
+        openAppIconById={{}}
+        onUpdateAppSettings={onUpdateAppSettings}
+        onRunDoctor={vi.fn().mockResolvedValue(createDoctorResult())}
+        onUpdateWorkspaceCodexBin={vi.fn().mockResolvedValue(undefined)}
+        onUpdateWorkspaceSettings={vi.fn().mockResolvedValue(undefined)}
+        scaleShortcutTitle="Scale shortcut"
+        scaleShortcutText="Use Command +/-"
+        onTestNotificationSound={vi.fn()}
+        onTestSystemNotification={vi.fn()}
+        dictationModelStatus={null}
+        onDownloadDictationModel={vi.fn()}
+        onCancelDictationDownload={vi.fn()}
+        onRemoveDictationModel={vi.fn()}
+        initialSection="codex"
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Default provider"), {
+      target: { value: "claude" },
+    });
+
+    await waitFor(() => {
+      expect(onUpdateAppSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ defaultProvider: "claude" }),
+      );
+    });
+  });
+
+  it("updates workspace provider override on change", async () => {
+    cleanup();
+    const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
+    const workspaceInfo: WorkspaceInfo = {
+      id: "w1",
+      name: "Workspace",
+      path: "/tmp/workspace",
+      connected: false,
+      codex_bin: null,
+      kind: "main",
+      parentId: null,
+      worktree: null,
+      settings: { sidebarCollapsed: false, provider: null },
+    };
+
+    render(
+      <SettingsView
+        workspaceGroups={[]}
+        groupedWorkspaces={[
+          { id: null, name: "Ungrouped", workspaces: [workspaceInfo] },
+        ]}
+        ungroupedLabel="Ungrouped"
+        onClose={vi.fn()}
+        onMoveWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
+        onCreateWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onRenameWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onMoveWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onDeleteWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onAssignWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        reduceTransparency={false}
+        onToggleTransparency={vi.fn()}
+        appSettings={baseSettings}
+        openAppIconById={{}}
+        onUpdateAppSettings={vi.fn().mockResolvedValue(undefined)}
+        onRunDoctor={vi.fn().mockResolvedValue(createDoctorResult())}
+        onUpdateWorkspaceCodexBin={vi.fn().mockResolvedValue(undefined)}
+        onUpdateWorkspaceSettings={onUpdateWorkspaceSettings}
+        scaleShortcutTitle="Scale shortcut"
+        scaleShortcutText="Use Command +/-"
+        onTestNotificationSound={vi.fn()}
+        onTestSystemNotification={vi.fn()}
+        dictationModelStatus={null}
+        onDownloadDictationModel={vi.fn()}
+        onCancelDictationDownload={vi.fn()}
+        onRemoveDictationModel={vi.fn()}
+        initialSection="codex"
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Provider override for Workspace"), {
+      target: { value: "claude" },
+    });
+
+    await waitFor(() => {
+      expect(onUpdateWorkspaceSettings).toHaveBeenCalledWith("w1", {
+        provider: "claude",
+      });
+    });
+  });
+
+  it("clears workspace provider override", async () => {
+    cleanup();
+    const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
+    const workspaceInfo: WorkspaceInfo = {
+      id: "w1",
+      name: "Workspace",
+      path: "/tmp/workspace",
+      connected: false,
+      codex_bin: null,
+      kind: "main",
+      parentId: null,
+      worktree: null,
+      settings: { sidebarCollapsed: false, provider: "claude" },
+    };
+
+    render(
+      <SettingsView
+        workspaceGroups={[]}
+        groupedWorkspaces={[
+          { id: null, name: "Ungrouped", workspaces: [workspaceInfo] },
+        ]}
+        ungroupedLabel="Ungrouped"
+        onClose={vi.fn()}
+        onMoveWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
+        onCreateWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onRenameWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onMoveWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onDeleteWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onAssignWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        reduceTransparency={false}
+        onToggleTransparency={vi.fn()}
+        appSettings={baseSettings}
+        openAppIconById={{}}
+        onUpdateAppSettings={vi.fn().mockResolvedValue(undefined)}
+        onRunDoctor={vi.fn().mockResolvedValue(createDoctorResult())}
+        onUpdateWorkspaceCodexBin={vi.fn().mockResolvedValue(undefined)}
+        onUpdateWorkspaceSettings={onUpdateWorkspaceSettings}
+        scaleShortcutTitle="Scale shortcut"
+        scaleShortcutText="Use Command +/-"
+        onTestNotificationSound={vi.fn()}
+        onTestSystemNotification={vi.fn()}
+        dictationModelStatus={null}
+        onDownloadDictationModel={vi.fn()}
+        onCancelDictationDownload={vi.fn()}
+        onRemoveDictationModel={vi.fn()}
+        initialSection="codex"
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Provider override for Workspace"), {
+      target: { value: "" },
+    });
+
+    await waitFor(() => {
+      expect(onUpdateWorkspaceSettings).toHaveBeenCalledWith("w1", {
+        provider: null,
+      });
+    });
+  });
+
   it("updates workspace Codex args override on blur", async () => {
+    cleanup();
     const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
     const workspace: WorkspaceInfo = {
       id: "w1",

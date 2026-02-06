@@ -813,6 +813,17 @@
   white-space: nowrap;
 }
 
+.thread-provider-icon {
+  flex: none;
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+.thread-provider-icon-claude {
+  color: #d47a2a;
+}
+
 .thread-meta {
   margin-left: auto;
   display: inline-flex;

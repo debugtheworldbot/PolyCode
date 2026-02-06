@@ -17,17 +17,30 @@ export function useWorkspaceRestore({
   connectWorkspace,
   listThreadsForWorkspace,
 }: WorkspaceRestoreOptions) {
-  const restoredWorkspaces = useRef(new Set<string>());
+  const restoreSignatureByWorkspace = useRef<Record<string, string>>({});
 
   useEffect(() => {
     if (!hasLoaded) {
       return;
     }
+    const signatures = restoreSignatureByWorkspace.current;
+    const activeWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+    Object.keys(signatures).forEach((workspaceId) => {
+      if (!activeWorkspaceIds.has(workspaceId)) {
+        delete signatures[workspaceId];
+      }
+    });
+
     workspaces.forEach((workspace) => {
-      if (restoredWorkspaces.current.has(workspace.id)) {
+      const nextSignature = [
+        workspace.path,
+        workspace.connected ? "1" : "0",
+        workspace.settings.provider ?? "",
+      ].join("|");
+      if (signatures[workspace.id] === nextSignature) {
         return;
       }
-      restoredWorkspaces.current.add(workspace.id);
+      signatures[workspace.id] = nextSignature;
       void (async () => {
         try {
           if (!workspace.connected) {

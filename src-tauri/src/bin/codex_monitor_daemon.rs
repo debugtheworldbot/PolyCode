@@ -3,29 +3,31 @@
 mod backend;
 #[path = "../codex/args.rs"]
 mod codex_args;
-#[path = "../codex/home.rs"]
-mod codex_home;
 #[path = "../codex/config.rs"]
 mod codex_config;
+#[path = "../codex/home.rs"]
+mod codex_home;
 #[path = "../files/io.rs"]
 mod file_io;
 #[path = "../files/ops.rs"]
 mod file_ops;
 #[path = "../files/policy.rs"]
 mod file_policy;
+#[path = "../providers/mod.rs"]
+mod providers;
 #[path = "../rules.rs"]
 mod rules;
-#[path = "../storage.rs"]
-mod storage;
 #[path = "../shared/mod.rs"]
 mod shared;
+#[path = "../storage.rs"]
+mod storage;
+#[allow(dead_code)]
+#[path = "../types.rs"]
+mod types;
 #[path = "../utils.rs"]
 mod utils;
 #[path = "../workspaces/settings.rs"]
 mod workspace_settings;
-#[allow(dead_code)]
-#[path = "../types.rs"]
-mod types;
 
 // Provide feature-style module paths for shared cores when compiled in the daemon.
 mod codex {
@@ -68,16 +70,19 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use backend::app_server::{
-    spawn_workspace_session, WorkspaceSession,
+    spawn_passthrough_workspace_session, spawn_workspace_session, WorkspaceSession,
 };
 use backend::events::{AppServerEvent, EventSink, TerminalExit, TerminalOutput};
-use storage::{read_settings, read_workspaces};
-use shared::{codex_core, files_core, git_core, settings_core, workspaces_core, worktree_core};
 use shared::codex_core::CodexLoginCancelState;
-use workspace_settings::apply_workspace_settings_update;
-use types::{
-    AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceSettings, WorktreeSetupStatus,
+use shared::{
+    claude_core, codex_core, files_core, git_core, settings_core, workspaces_core, worktree_core,
 };
+use storage::{read_settings, read_workspaces};
+use types::{
+    AppSettings, ProviderKind, WorkspaceEntry, WorkspaceInfo, WorkspaceSettings,
+    WorktreeSetupStatus,
+};
+use workspace_settings::apply_workspace_settings_update;
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4732";
 
@@ -89,14 +94,38 @@ fn spawn_with_client(
     codex_args: Option<String>,
     codex_home: Option<PathBuf>,
 ) -> impl std::future::Future<Output = Result<Arc<WorkspaceSession>, String>> {
-    spawn_workspace_session(
-        entry,
-        default_bin,
-        codex_args,
-        codex_home,
-        client_version,
-        event_sink,
-    )
+    let provider = providers::resolve_workspace_provider(&entry, None);
+    let workspace_id = entry.id.clone();
+    async move {
+        providers::ensure_provider_spawn_supported(&provider)?;
+        let session = match provider {
+            ProviderKind::Codex => {
+                spawn_workspace_session(
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                    client_version,
+                    event_sink.clone(),
+                )
+                .await?
+            }
+            ProviderKind::Claude => spawn_passthrough_workspace_session(entry).await?,
+            ProviderKind::Gemini => {
+                return Err("Provider `gemini` is not implemented yet.".to_string())
+            }
+        };
+        if matches!(provider, ProviderKind::Claude) {
+            event_sink.emit_app_server_event(AppServerEvent {
+                workspace_id: workspace_id.clone(),
+                message: json!({
+                    "method": "codex/connected",
+                    "params": { "workspaceId": workspace_id.clone() }
+                }),
+            });
+        }
+        Ok(session)
+    }
 }
 
 #[derive(Clone)]
@@ -142,6 +171,9 @@ struct DaemonState {
     app_settings: Mutex<AppSettings>,
     event_sink: DaemonEventSink,
     codex_login_cancels: Mutex<HashMap<String, CodexLoginCancelState>>,
+    claude_threads_path: PathBuf,
+    claude_threads: claude_core::ClaudeThreadsStore,
+    claude_turn_cancels: claude_core::ClaudeTurnCancelsStore,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -150,12 +182,103 @@ struct WorkspaceFileResponse {
     truncated: bool,
 }
 
+fn value_as_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return i64::try_from(number).ok();
+    }
+    value.as_str().and_then(|raw| raw.parse::<i64>().ok())
+}
+
+fn thread_timestamp(thread: &Value) -> i64 {
+    value_as_i64(thread.get("updatedAt"))
+        .or_else(|| value_as_i64(thread.get("updated_at")))
+        .or_else(|| value_as_i64(thread.get("createdAt")))
+        .or_else(|| value_as_i64(thread.get("created_at")))
+        .unwrap_or(0)
+}
+
+fn thread_list_entries_with_provider(response: Value, provider: &ProviderKind) -> Vec<Value> {
+    let mut entries = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    entries.iter_mut().for_each(|entry| {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("provider".to_string(), json!(provider.as_str()));
+        }
+    });
+    entries
+}
+
+fn with_thread_provider(response: Value, provider: &ProviderKind) -> Value {
+    let mut response = response;
+    if let Some(thread) = response
+        .as_object_mut()
+        .and_then(|root| root.get_mut("result"))
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("thread"))
+        .and_then(Value::as_object_mut)
+    {
+        thread.insert("provider".to_string(), json!(provider.as_str()));
+    }
+    response
+}
+
 impl DaemonState {
+    async fn workspace_provider(&self, workspace_id: &str) -> Result<ProviderKind, String> {
+        let entry = {
+            let workspaces = self.workspaces.lock().await;
+            workspaces
+                .get(workspace_id)
+                .cloned()
+                .ok_or_else(|| "workspace not found".to_string())?
+        };
+        let settings = self.app_settings.lock().await.clone();
+        Ok(providers::resolve_workspace_provider(&entry, Some(&settings)))
+    }
+
+    async fn workspace_path(&self, workspace_id: &str) -> Result<String, String> {
+        let workspaces = self.workspaces.lock().await;
+        workspaces
+            .get(workspace_id)
+            .map(|entry| entry.path.clone())
+            .ok_or_else(|| "workspace not found".to_string())
+    }
+
+    async fn thread_provider(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<ProviderKind, String> {
+        if !thread_id.trim().is_empty() {
+            let has_claude_thread = {
+                let store = self.claude_threads.lock().await;
+                store
+                    .get(workspace_id)
+                    .map(|threads| threads.iter().any(|thread| thread.id == thread_id))
+                    .unwrap_or(false)
+            };
+            if has_claude_thread {
+                return Ok(ProviderKind::Claude);
+            }
+        }
+        self.workspace_provider(workspace_id).await
+    }
+
     fn load(config: &DaemonConfig, event_sink: DaemonEventSink) -> Self {
         let storage_path = config.data_dir.join("workspaces.json");
         let settings_path = config.data_dir.join("settings.json");
+        let claude_threads_path = claude_core::claude_threads_path(&config.data_dir);
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
+        let claude_threads = claude_core::read_threads_snapshot(&claude_threads_path)
+            .unwrap_or_default();
         Self {
             data_dir: config.data_dir.clone(),
             workspaces: Mutex::new(workspaces),
@@ -165,6 +288,9 @@ impl DaemonState {
             app_settings: Mutex::new(app_settings),
             event_sink,
             codex_login_cancels: Mutex::new(HashMap::new()),
+            claude_threads_path,
+            claude_threads: Arc::new(Mutex::new(claude_threads)),
+            claude_turn_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -252,14 +378,21 @@ impl DaemonState {
         .await
     }
 
-    async fn worktree_setup_status(&self, workspace_id: String) -> Result<WorktreeSetupStatus, String> {
+    async fn worktree_setup_status(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorktreeSetupStatus, String> {
         workspaces_core::worktree_setup_status_core(&self.workspaces, &workspace_id, &self.data_dir)
             .await
     }
 
     async fn worktree_setup_mark_ran(&self, workspace_id: String) -> Result<(), String> {
-        workspaces_core::worktree_setup_mark_ran_core(&self.workspaces, &workspace_id, &self.data_dir)
-            .await
+        workspaces_core::worktree_setup_mark_ran_core(
+            &self.workspaces,
+            &workspace_id,
+            &self.data_dir,
+        )
+        .await
     }
 
     async fn remove_workspace(&self, id: String) -> Result<(), String> {
@@ -326,7 +459,9 @@ impl DaemonState {
                 }
             },
             |value| worktree_core::sanitize_worktree_name(value),
-            |root, name, current| worktree_core::unique_worktree_path_for_rename(root, name, current),
+            |root, name, current| {
+                worktree_core::unique_worktree_path_for_rename(root, name, current)
+            },
             |root, args| {
                 workspaces_core::run_git_command_unit(root, args, git_core::run_git_command_owned)
             },
@@ -510,11 +645,43 @@ impl DaemonState {
     }
 
     async fn start_thread(&self, workspace_id: String) -> Result<Value, String> {
-        codex_core::start_thread_core(&self.sessions, workspace_id).await
+        match self.workspace_provider(&workspace_id).await? {
+            ProviderKind::Codex => codex_core::start_thread_core(&self.sessions, workspace_id).await,
+            ProviderKind::Claude => {
+                claude_core::start_thread_core(
+                    &self.workspaces,
+                    &self.app_settings,
+                    &self.claude_threads,
+                    &self.claude_threads_path,
+                    workspace_id,
+                    self.event_sink.clone(),
+                )
+                .await
+            }
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
-    async fn resume_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
-        codex_core::resume_thread_core(&self.sessions, workspace_id, thread_id).await
+    async fn resume_thread(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        let provider = self.thread_provider(&workspace_id, &thread_id).await?;
+        match provider {
+            ProviderKind::Codex => {
+                let response =
+                    codex_core::resume_thread_core(&self.sessions, workspace_id, thread_id).await?;
+                Ok(with_thread_provider(response, &ProviderKind::Codex))
+            }
+            ProviderKind::Claude => {
+                let response =
+                    claude_core::resume_thread_core(&self.claude_threads, workspace_id, thread_id)
+                        .await?;
+                Ok(with_thread_provider(response, &ProviderKind::Claude))
+            }
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn fork_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
@@ -527,7 +694,45 @@ impl DaemonState {
         cursor: Option<String>,
         limit: Option<u32>,
     ) -> Result<Value, String> {
-        codex_core::list_threads_core(&self.sessions, workspace_id, cursor, limit).await
+        let _ = cursor;
+        let _ = limit;
+        let workspace_path = self.workspace_path(&workspace_id).await?;
+        let fetch_limit = Some(100);
+
+        let codex_response =
+            codex_core::list_threads_core(&self.sessions, workspace_id.clone(), None, fetch_limit)
+                .await
+                .ok();
+        let claude_response = claude_core::list_threads_core(
+            &self.claude_threads,
+            &self.claude_threads_path,
+            workspace_id,
+            workspace_path,
+            None,
+            fetch_limit,
+        )
+        .await
+        .ok();
+
+        if codex_response.is_none() && claude_response.is_none() {
+            return Err("failed to list threads for codex and claude providers".to_string());
+        }
+
+        let mut data = Vec::<Value>::new();
+        if let Some(response) = codex_response {
+            data.extend(thread_list_entries_with_provider(response, &ProviderKind::Codex));
+        }
+        if let Some(response) = claude_response {
+            data.extend(thread_list_entries_with_provider(response, &ProviderKind::Claude));
+        }
+        data.sort_by(|left, right| thread_timestamp(right).cmp(&thread_timestamp(left)));
+
+        Ok(json!({
+            "result": {
+                "data": data,
+                "nextCursor": Value::Null,
+            }
+        }))
     }
 
     async fn list_mcp_server_status(
@@ -536,14 +741,43 @@ impl DaemonState {
         cursor: Option<String>,
         limit: Option<u32>,
     ) -> Result<Value, String> {
-        codex_core::list_mcp_server_status_core(&self.sessions, workspace_id, cursor, limit).await
+        match self.workspace_provider(&workspace_id).await? {
+            ProviderKind::Codex => {
+                codex_core::list_mcp_server_status_core(&self.sessions, workspace_id, cursor, limit)
+                    .await
+            }
+            ProviderKind::Claude => Ok(json!({ "result": { "data": [], "nextCursor": null } })),
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
-    async fn archive_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
-        codex_core::archive_thread_core(&self.sessions, workspace_id, thread_id).await
+    async fn archive_thread(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        match self.thread_provider(&workspace_id, &thread_id).await? {
+            ProviderKind::Codex => {
+                codex_core::archive_thread_core(&self.sessions, workspace_id, thread_id).await
+            }
+            ProviderKind::Claude => {
+                claude_core::archive_thread_core(
+                    &self.claude_threads,
+                    &self.claude_threads_path,
+                    workspace_id,
+                    thread_id,
+                )
+                .await
+            }
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
-    async fn compact_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
+    async fn compact_thread(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
         codex_core::compact_thread_core(&self.sessions, workspace_id, thread_id).await
     }
 
@@ -553,7 +787,23 @@ impl DaemonState {
         thread_id: String,
         name: String,
     ) -> Result<Value, String> {
-        codex_core::set_thread_name_core(&self.sessions, workspace_id, thread_id, name).await
+        match self.thread_provider(&workspace_id, &thread_id).await? {
+            ProviderKind::Codex => {
+                codex_core::set_thread_name_core(&self.sessions, workspace_id, thread_id, name)
+                    .await
+            }
+            ProviderKind::Claude => {
+                claude_core::set_thread_name_core(
+                    &self.claude_threads,
+                    &self.claude_threads_path,
+                    workspace_id,
+                    thread_id,
+                    name,
+                )
+                .await
+            }
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn send_user_message(
@@ -567,18 +817,42 @@ impl DaemonState {
         images: Option<Vec<String>>,
         collaboration_mode: Option<Value>,
     ) -> Result<Value, String> {
-        codex_core::send_user_message_core(
-            &self.sessions,
-            workspace_id,
-            thread_id,
-            text,
-            model,
-            effort,
-            access_mode,
-            images,
-            collaboration_mode,
-        )
-        .await
+        match self.thread_provider(&workspace_id, &thread_id).await? {
+            ProviderKind::Codex => {
+                codex_core::send_user_message_core(
+                    &self.sessions,
+                    workspace_id,
+                    thread_id,
+                    text,
+                    model,
+                    effort,
+                    access_mode,
+                    images,
+                    collaboration_mode,
+                )
+                .await
+            }
+            ProviderKind::Claude => {
+                let _ = model;
+                let _ = effort;
+                let _ = access_mode;
+                let _ = collaboration_mode;
+                claude_core::send_user_message_core(
+                    &self.workspaces,
+                    &self.app_settings,
+                    &self.claude_threads,
+                    &self.claude_turn_cancels,
+                    &self.claude_threads_path,
+                    workspace_id,
+                    thread_id,
+                    text,
+                    images,
+                    self.event_sink.clone(),
+                )
+                .await
+            }
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn turn_interrupt(
@@ -587,7 +861,22 @@ impl DaemonState {
         thread_id: String,
         turn_id: String,
     ) -> Result<Value, String> {
-        codex_core::turn_interrupt_core(&self.sessions, workspace_id, thread_id, turn_id).await
+        match self.thread_provider(&workspace_id, &thread_id).await? {
+            ProviderKind::Codex => {
+                codex_core::turn_interrupt_core(&self.sessions, workspace_id, thread_id, turn_id)
+                    .await
+            }
+            ProviderKind::Claude => {
+                let _ = turn_id;
+                claude_core::turn_interrupt_core(
+                    &self.claude_turn_cancels,
+                    workspace_id,
+                    thread_id,
+                )
+                .await
+            }
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn start_review(
@@ -602,7 +891,11 @@ impl DaemonState {
     }
 
     async fn model_list(&self, workspace_id: String) -> Result<Value, String> {
-        codex_core::model_list_core(&self.sessions, workspace_id).await
+        match self.workspace_provider(&workspace_id).await? {
+            ProviderKind::Codex => codex_core::model_list_core(&self.sessions, workspace_id).await,
+            ProviderKind::Claude => Ok(json!({ "result": { "data": [] } })),
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn collaboration_mode_list(&self, workspace_id: String) -> Result<Value, String> {
@@ -610,11 +903,38 @@ impl DaemonState {
     }
 
     async fn account_rate_limits(&self, workspace_id: String) -> Result<Value, String> {
-        codex_core::account_rate_limits_core(&self.sessions, workspace_id).await
+        match self.workspace_provider(&workspace_id).await? {
+            ProviderKind::Codex => {
+                codex_core::account_rate_limits_core(&self.sessions, workspace_id).await
+            }
+            ProviderKind::Claude => Ok(json!({
+                "result": {
+                    "rateLimits": {
+                        "primary": null
+                    }
+                }
+            })),
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn account_read(&self, workspace_id: String) -> Result<Value, String> {
-        codex_core::account_read_core(&self.sessions, &self.workspaces, workspace_id).await
+        match self.workspace_provider(&workspace_id).await? {
+            ProviderKind::Codex => {
+                codex_core::account_read_core(&self.sessions, &self.workspaces, workspace_id).await
+            }
+            ProviderKind::Claude => Ok(json!({
+                "result": {
+                    "account": {
+                        "type": "unknown",
+                        "email": null,
+                        "planType": null
+                    },
+                    "requiresOpenaiAuth": false
+                }
+            })),
+            ProviderKind::Gemini => Err("Provider `gemini` is not implemented yet.".to_string()),
+        }
     }
 
     async fn codex_login(&self, workspace_id: String) -> Result<Value, String> {
@@ -645,8 +965,13 @@ impl DaemonState {
         request_id: Value,
         result: Value,
     ) -> Result<Value, String> {
-        codex_core::respond_to_server_request_core(&self.sessions, workspace_id, request_id, result)
-            .await?;
+        codex_core::respond_to_server_request_core(
+            &self.sessions,
+            workspace_id,
+            request_id,
+            result,
+        )
+        .await?;
         Ok(json!({ "ok": true }))
     }
 
@@ -748,8 +1073,7 @@ fn read_workspace_file_inner(
         buffer.truncate(MAX_WORKSPACE_FILE_BYTES as usize);
     }
 
-    let content =
-        String::from_utf8(buffer).map_err(|_| "File is not valid UTF-8".to_string())?;
+    let content = String::from_utf8(buffer).map_err(|_| "File is not valid UTF-8".to_string())?;
     Ok(WorkspaceFileResponse { content, truncated })
 }
 
@@ -842,15 +1166,19 @@ fn build_error_response(id: Option<u64>, message: &str) -> Option<String> {
             "id": id,
             "error": { "message": message }
         }))
-        .unwrap_or_else(|_| "{\"id\":0,\"error\":{\"message\":\"serialization failed\"}}".to_string()),
+        .unwrap_or_else(|_| {
+            "{\"id\":0,\"error\":{\"message\":\"serialization failed\"}}".to_string()
+        }),
     )
 }
 
 fn build_result_response(id: Option<u64>, result: Value) -> Option<String> {
     let id = id?;
-    Some(serde_json::to_string(&json!({ "id": id, "result": result })).unwrap_or_else(|_| {
-        "{\"id\":0,\"error\":{\"message\":\"serialization failed\"}}".to_string()
-    }))
+    Some(
+        serde_json::to_string(&json!({ "id": id, "result": result })).unwrap_or_else(|_| {
+            "{\"id\":0,\"error\":{\"message\":\"serialization failed\"}}".to_string()
+        }),
+    )
 }
 
 fn build_event_notification(event: DaemonEvent) -> Option<String> {
@@ -925,12 +1253,15 @@ fn parse_optional_bool(value: &Value, key: &str) -> Option<bool> {
 
 fn parse_optional_string_array(value: &Value, key: &str) -> Option<Vec<String>> {
     match value {
-        Value::Object(map) => map.get(key).and_then(|value| value.as_array()).map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(|value| value.to_string()))
-                .collect::<Vec<_>>()
-        }),
+        Value::Object(map) => map
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                    .collect::<Vec<_>>()
+            }),
         _ => None,
     }
 }
@@ -1139,7 +1470,9 @@ async fn handle_rpc_request(
             let workspace_id = parse_string(&params, "workspaceId")?;
             let cursor = parse_optional_string(&params, "cursor");
             let limit = parse_optional_u32(&params, "limit");
-            state.list_mcp_server_status(workspace_id, cursor, limit).await
+            state
+                .list_mcp_server_status(workspace_id, cursor, limit)
+                .await
         }
         "archive_thread" => {
             let workspace_id = parse_string(&params, "workspaceId")?;
@@ -1194,7 +1527,9 @@ async fn handle_rpc_request(
                 .cloned()
                 .ok_or("missing `target`")?;
             let delivery = parse_optional_string(&params, "delivery");
-            state.start_review(workspace_id, thread_id, target, delivery).await
+            state
+                .start_review(workspace_id, thread_id, target, delivery)
+                .await
         }
         "model_list" => {
             let workspace_id = parse_string(&params, "workspaceId")?;

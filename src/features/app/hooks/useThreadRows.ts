@@ -22,7 +22,17 @@ export function useThreadRows(threadParentById: Record<string, string>) {
       workspaceId: string,
       getPinTimestamp: (workspaceId: string, threadId: string) => number | null,
     ): ThreadRowResult => {
-      const threadIds = new Set(threads.map((thread) => thread.id));
+      const uniqueThreads: ThreadSummary[] = [];
+      const seenThreadIds = new Set<string>();
+      threads.forEach((thread) => {
+        if (!thread.id || seenThreadIds.has(thread.id)) {
+          return;
+        }
+        seenThreadIds.add(thread.id);
+        uniqueThreads.push(thread);
+      });
+
+      const threadIds = new Set(uniqueThreads.map((thread) => thread.id));
       const childrenByParent = new Map<string, ThreadSummary[]>();
       const roots: ThreadSummary[] = [];
       const resolveVisibleParentId = (threadId: string) => {
@@ -38,7 +48,7 @@ export function useThreadRows(threadParentById: Record<string, string>) {
         return null;
       };
 
-      threads.forEach((thread) => {
+      uniqueThreads.forEach((thread) => {
         const parentId = resolveVisibleParentId(thread.id);
         if (parentId) {
           const list = childrenByParent.get(parentId) ?? [];

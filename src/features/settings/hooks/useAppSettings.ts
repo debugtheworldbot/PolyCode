@@ -19,10 +19,16 @@ import { getDefaultInterruptShortcut } from "../../../utils/shortcuts";
 
 const allowedThemes = new Set(["system", "light", "dark", "dim"]);
 const allowedPersonality = new Set(["friendly", "pragmatic"]);
+const allowedProviders = new Set(["codex", "claude", "gemini"]);
 
 const defaultSettings: AppSettings = {
   codexBin: null,
   codexArgs: null,
+  defaultProvider: null,
+  claudeBin: null,
+  claudeArgs: null,
+  geminiBin: null,
+  geminiArgs: null,
   backendMode: "local",
   remoteBackendHost: "127.0.0.1:4732",
   remoteBackendToken: null,
@@ -107,6 +113,14 @@ function normalizeAppSettings(settings: AppSettings): AppSettings {
     ...settings,
     codexBin: settings.codexBin?.trim() ? settings.codexBin.trim() : null,
     codexArgs: settings.codexArgs?.trim() ? settings.codexArgs.trim() : null,
+    defaultProvider:
+      settings.defaultProvider && allowedProviders.has(settings.defaultProvider)
+        ? settings.defaultProvider
+        : null,
+    claudeBin: settings.claudeBin?.trim() ? settings.claudeBin.trim() : null,
+    claudeArgs: settings.claudeArgs?.trim() ? settings.claudeArgs.trim() : null,
+    geminiBin: settings.geminiBin?.trim() ? settings.geminiBin.trim() : null,
+    geminiArgs: settings.geminiArgs?.trim() ? settings.geminiArgs.trim() : null,
     uiScale: clampUiScale(settings.uiScale),
     theme: allowedThemes.has(settings.theme) ? settings.theme : "system",
     uiFontFamily: normalizeFontFamily(
