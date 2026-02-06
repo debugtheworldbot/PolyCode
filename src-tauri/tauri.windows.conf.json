@@ -2,7 +2,7 @@
   "app": {
     "windows": [
       {
-        "title": "Codex Monitor",
+        "title": "PolyCode",
         "width": 1200,
         "height": 700,
         "minWidth": 360,
